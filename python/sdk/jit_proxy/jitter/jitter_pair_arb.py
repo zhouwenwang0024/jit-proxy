@@ -1,43 +1,34 @@
-# python/sdk/jit_proxy/jitter/jitter_pair_arb.py
+# python/sdk/jit_proxy/jitter/jitter_sniper.py
 # -*- coding: utf-8 -*-
 #
-# 作用：
-#   - 以 jitter_sniper 的“只在命中时出手”为风格，做你的“配对原子套利”（TT/MT/TM 三类两腿组合）
-#   - 严格不盈利不广播：链下先筛选 + simulate，通过才 send；链上再由 arb_perp_plan 做护栏
+# 目标：长期运行的“狙击”脚本，直接驱动链上的 programs/jit-proxy/src/instructions/arb_perp.rs
+# 原则：每轮循环只“试探”一次——先 simulate 调用 arb_perp，成功才广播；链上仍有二次护栏（没交叉/不赚钱会回滚）。
 #
-# 依赖：
-#   pip install anchorpy==0.16.0 solana==0.30.2
-#
-# 环境变量（示例）：
+# 必备环境变量（示例）：
 #   RPC_URL=...
-#   WALLET_KEYPAIR_JSON='[.., .., ..]'        # u8 JSON 数组
-#   JIT_PROXY_PROGRAM_ID=...                  # 你的 jit-proxy program id
-#   DRIFT_PROGRAM_ID=...                      # drift program id
+#   WALLET_KEYPAIR_JSON='[.., ..]'        # u8 数组 JSON
+#   JIT_PROXY_PROGRAM_ID=...              # 你的 jit-proxy 程序 id
+#   DRIFT_PROGRAM_ID=...                  # drift v2 程序 id
 #   DRIFT_STATE=...
 #   DRIFT_USER=...
 #   DRIFT_USER_STATS=...
-#   DRIFT_PERP_MARKET=...
-#   DRIFT_ORACLE=...
-#   DRIFT_QUOTE_SPOT_MARKET=...
+#   DRIFT_PERP_MARKET=...                 # 目标 market 的 PerpMarket PDA
+#   DRIFT_ORACLE=...                      # 对应 oracle
+#   DRIFT_QUOTE_SPOT_MARKET=...           # 一般是 spot 0 (USDC)
 #   MARKET_INDEX=0
-#   MIN_EDGE_BPS=6
-#   BASE_SZ=1000000000                        # 1e9 = 1.0 base
-#   LOOP_INTERVAL_MS=200
-#   IDL_PATH=target/idl/jit_proxy.json        # 用 anchor build 产出的 IDL
-#
-#   （演示喂价，可删）
-#   MAKER_BID_PX=173100000 ; MAKER_BID_SZ=1000000000
-#   MAKER_ASK_PX=173020000 ; MAKER_ASK_SZ=1000000000
-#   # 如需要拍卖 taker 价：
-#   # TAKER_BID_PX=173110000 ; TAKER_BID_SZ=1000000000
-#   # TAKER_ASK_PX=173010000 ; TAKER_ASK_SZ=1000000000
+#   LOOP_INTERVAL_MS=250                  # 轮询间隔
+#   COOLDOWN_MS_ON_SUCCESS=800            # 成功后冷却
+#   CU_LIMIT=1200000                      # 可选：Compute Unit 限额
+#   CU_PRICE_MICROLAMPORTS=0              # 可选：优先费（微 lamports）
+#   MAKER_USERS=pubkey1,pubkey2           # 可选：让链上只在这些 maker 集合内找最优价（提高命中率）
+#   MAKER_USER_STATS=pubkey1s,pubkey2s    # 与 MAKER_USERS 一一对应
+#   IDL_PATH=target/idl/jit_proxy.json
 #
 import os
 import json
 import time
 import asyncio
-from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import List, Optional
 
 from solana.publickey import PublicKey
 from solana.keypair import Keypair
@@ -49,205 +40,120 @@ from solana.rpc.types import TxOpts
 
 from anchorpy import Provider, Wallet, Program, Context, Idl
 
-# ===== 与链上 IDL 对齐的基础类型 =====
-class PositionDirection:
-    Long = 0
-    Short = 1
-
-class LegKind:
-    Make = 0   # place_and_make（JIT maker）
-    Take = 1   # place_and_take（IOC）
-
-@dataclass
-class PlanLeg:
-    direction: int  # PositionDirection
-    price: int      # PRICE_PRECISION (1e6) 的整数
-    base_sz: int    # BASE_PRECISION  (1e9) 的整数
-    kind: int       # LegKind
-
-@dataclass
-class Quote:
-    price: int  # PRICE_PRECISION 整数
-    size: int   # BASE_PRECISION  整数
-
-# ===== 行情源（适配你现有订阅/拍卖流；像 sniper 一样只在命中时出手）=====
-class QuoteSource:
-    async def best_maker_bid(self) -> Optional[Quote]:
-        return None
-    async def best_maker_ask(self) -> Optional[Quote]:
-        return None
-    async def best_taker_bid(self) -> Optional[Quote]:
-        return None
-    async def best_taker_ask(self) -> Optional[Quote]:
-        return None
-
-class EnvQuoteSource(QuoteSource):
-    """演示实现：从环境变量读取价量，方便先跑通流程；生产中替换为 DLOB/拍卖订阅"""
-    async def best_maker_bid(self):
-        px, sz = os.environ.get("MAKER_BID_PX"), os.environ.get("MAKER_BID_SZ")
-        return Quote(int(px), int(sz)) if px and sz else None
-    async def best_maker_ask(self):
-        px, sz = os.environ.get("MAKER_ASK_PX"), os.environ.get("MAKER_ASK_SZ")
-        return Quote(int(px), int(sz)) if px and sz else None
-    async def best_taker_bid(self):
-        px, sz = os.environ.get("TAKER_BID_PX"), os.environ.get("TAKER_BID_SZ")
-        return Quote(int(px), int(sz)) if px and sz else None
-    async def best_taker_ask(self):
-        px, sz = os.environ.get("TAKER_ASK_PX"), os.environ.get("TAKER_ASK_SZ")
-        return Quote(int(px), int(sz)) if px and sz else None
-
-# ===== 策略工具 =====
-def edge_bps(buy_px: int, sell_px: int) -> int:
-    """(sell - buy) / buy * 1e4，sell>buy 才有正 edge"""
-    if sell_px <= buy_px:
-        return -1
-    return int(((sell_px - buy_px) * 10_000) // buy_px)
-
-def pick_best_plan(
-    maker_bid: Optional[Quote],
-    maker_ask: Optional[Quote],
-    taker_bid: Optional[Quote],
-    taker_ask: Optional[Quote],
-    base_sz: int,
-    min_edge_bps: int,
-) -> Optional[Tuple[PlanLeg, PlanLeg, int, str]]:
-    """
-    枚举三种组合：TT / MT / TM，选 bps 最大且 >= min_edge_bps 的方案。
-    返回：first_leg, second_leg, bps, tag
-    """
-    cands: List[Tuple[PlanLeg, PlanLeg, int, str]] = []
-
-    # TT：makerBid ↔ makerAsk（两腿 TAKE/IOC）
-    if maker_bid and maker_ask:
-        buy_px, sell_px = maker_ask.price, maker_bid.price
-        bps = edge_bps(buy_px, sell_px)
-        if bps >= min_edge_bps:
-            cands.append((
-                PlanLeg(PositionDirection.Long,  buy_px,  base_sz, LegKind.Take),
-                PlanLeg(PositionDirection.Short, sell_px, base_sz, LegKind.Take),
-                bps, "TT"
-            ))
-
-    # MT：takerBid ↔ makerAsk（MAKE 卖给 taker 买；TAKE 买 maker 卖）
-    if taker_bid and maker_ask:
-        buy_px, sell_px = maker_ask.price, taker_bid.price
-        bps = edge_bps(buy_px, sell_px)
-        if bps >= min_edge_bps:
-            cands.append((
-                PlanLeg(PositionDirection.Long,  buy_px,  base_sz, LegKind.Take),
-                PlanLeg(PositionDirection.Short, sell_px, base_sz, LegKind.Make),
-                bps, "MT"
-            ))
-
-    # TM：makerBid ↔ takerAsk（TAKE 卖给 maker 买；MAKE 买接 taker 卖）
-    if maker_bid and taker_ask:
-        buy_px, sell_px = taker_ask.price, maker_bid.price
-        bps = edge_bps(buy_px, sell_px)
-        if bps >= min_edge_bps:
-            cands.append((
-                PlanLeg(PositionDirection.Long,  buy_px,  base_sz, LegKind.Make),
-                PlanLeg(PositionDirection.Short, sell_px, base_sz, LegKind.Take),
-                bps, "TM"
-            ))
-
-    if not cands:
-        return None
-    cands.sort(key=lambda x: x[2], reverse=True)
-    return cands[0]
-
+# ---------- 工具：读取密钥 ----------
 def keypair_from_json_env(var: str) -> Keypair:
     arr = json.loads(os.environ[var])
     return Keypair.from_secret_key(bytes(arr))
 
-async def build_remaining_accounts() -> List[AccountMeta]:
-    """
-    Drift CPI 所需的 remaining accounts：
-      - PerpMarket PDA
-      - Oracle
-      - Quote SpotMarket
-      - （如用 MAKE/JIT）拍卖 taker 的 User(+Stats) —— 视需要追加
-    """
-    req = [
+# ---------- 工具：Compute Budget（可选） ----------
+def build_compute_budget_ixs() -> List:
+    ixs = []
+    try:
+        # 仅当装了 solders compute_budget 时启用；否则静默跳过
+        from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
+        cu = int(os.environ.get("CU_LIMIT", "0"))
+        if cu > 0:
+            ixs.append(set_compute_unit_limit(cu))
+        cup = int(os.environ.get("CU_PRICE_MICROLAMPORTS", "0"))
+        if cup > 0:
+            ixs.append(set_compute_unit_price(cup))
+    except Exception:
+        pass
+    return ixs
+
+# ---------- 关键：把必需账户塞进 remaining_accounts ----------
+def build_remaining_accounts_from_env() -> List[AccountMeta]:
+    metas: List[AccountMeta] = []
+    req_keys = [
         "DRIFT_PERP_MARKET",
         "DRIFT_ORACLE",
         "DRIFT_QUOTE_SPOT_MARKET",
     ]
-    metas: List[AccountMeta] = []
-    for k in req:
+    for k in req_keys:
         v = os.environ.get(k)
-        if v:
-            metas.append(AccountMeta(pubkey=PublicKey(v), is_signer=False, is_writable=False))
-    # 可在此处按需 append 拍卖 taker 的 user/stats
-    # for u in (os.environ.get("MAKER_USERS","").split(",")):
-    #     if u: metas.append(AccountMeta(pubkey=PublicKey(u), is_signer=False, is_writable=False))
+        if not v:
+            raise RuntimeError(f"missing env {k}")
+        metas.append(AccountMeta(pubkey=PublicKey(v), is_signer=False, is_writable=False))
+
+    # 可选：指定一批 maker 的 User & UserStats，让链上只在这些用户里找 best bid/ask
+    mus = [x for x in os.environ.get("MAKER_USERS", "").split(",") if x]
+    mss = [x for x in os.environ.get("MAKER_USER_STATS", "").split(",") if x]
+    if mus and mss and len(mus) == len(mss):
+        for u in mus:
+            metas.append(AccountMeta(pubkey=PublicKey(u), is_signer=False, is_writable=False))
+        for s in mss:
+            metas.append(AccountMeta(pubkey=PublicKey(s), is_signer=False, is_writable=False))
     return metas
 
-# ===== Sniper 风格的“只在命中时出手”的双腿配对策略守护进程 =====
-class JitterPairArb:
-    def __init__(self, quote_source: QuoteSource):
-        self.qs = quote_source
-
+# ---------- 主体 ----------
+class ArbPerpSniper:
+    def __init__(self):
+        # 环境参数
         self.rpc = os.environ["RPC_URL"]
         self.program_id = PublicKey(os.environ["JIT_PROXY_PROGRAM_ID"])
         self.drift_program_id = PublicKey(os.environ["DRIFT_PROGRAM_ID"])
         self.wallet = keypair_from_json_env("WALLET_KEYPAIR_JSON")
         self.market_index = int(os.environ.get("MARKET_INDEX", "0"))
-        self.min_edge_bps = int(os.environ.get("MIN_EDGE_BPS", "6"))
-        self.base_sz = int(os.environ.get("BASE_SZ", str(int(1e9))))
-        self.loop_interval_ms = int(os.environ.get("LOOP_INTERVAL_MS", "200"))
-        self.idl_path = os.environ.get("IDL_PATH", "target/idl/jit_proxy.json")
+        self.loop_interval_ms = int(os.environ.get("LOOP_INTERVAL_MS", "250"))
+        self.cooldown_ms_on_success = int(os.environ.get("COOLDOWN_MS_ON_SUCCESS", "800"))
+        idl_path = os.environ.get("IDL_PATH", "target/idl/jit_proxy.json")
 
+        # 连接 & Program
         self.client = AsyncClient(self.rpc, commitment=Confirmed)
         self.provider = Provider(self.client, Wallet(self.wallet))
-        with open(self.idl_path, "r") as f:
+
+        with open(idl_path, "r") as f:
             idl_json = json.load(f)
         self.program = Program(Idl.from_json(idl_json), self.program_id, self.provider)
 
-    async def close(self):
-        await self.client.close()
-
-    async def _one_try(self) -> Optional[str]:
-        # 1) 拉取 best quotes
-        maker_bid = await self.qs.best_maker_bid()
-        maker_ask = await self.qs.best_maker_ask()
-        taker_bid = await self.qs.best_taker_bid()
-        taker_ask = await self.qs.best_taker_ask()
-
-        plan = pick_best_plan(maker_bid, maker_ask, taker_bid, taker_ask, self.base_sz, self.min_edge_bps)
-        if not plan:
-            return None
-        first, second, bps, tag = plan
-
-        # 2) 组参数与账户
-        args = {
-            "market_index": self.market_index,
-            "min_edge_bps": self.min_edge_bps,
-            "first": {
-                "direction": first.direction, "price": first.price,
-                "base_sz": first.base_sz,     "kind":  first.kind
-            },
-            "second": {
-                "direction": second.direction, "price": second.price,
-                "base_sz": second.base_sz,     "kind":  second.kind
-            },
-        }
-        accounts = {
+        # 固定账户（Anchor Accounts）
+        self.accounts = {
             "state":        PublicKey(os.environ["DRIFT_STATE"]),
             "user":         PublicKey(os.environ["DRIFT_USER"]),
             "userStats":    PublicKey(os.environ["DRIFT_USER_STATS"]),
             "authority":    self.wallet.public_key,
             "driftProgram": self.drift_program_id,
         }
-        remaining = await build_remaining_accounts()
 
-        # 3) 构造指令（只打一笔，Sniper 风格）
-        ix = await self.program.instruction["arb_perp_plan"](args, Context(
-            accounts=accounts,
-            remaining_accounts=remaining
-        ))
+        self.remaining_accounts = build_remaining_accounts_from_env()
 
-        # 4) 先 simulate（不盈利不广播）
+    async def close(self):
+        await self.client.close()
+
+    async def run_forever(self):
+        interval = max(1, self.loop_interval_ms) / 1000.0
+        backoff = 0.05
+        while True:
+            t0 = time.time()
+            try:
+                ok = await self.try_once()
+                # 成功后适当冷却，避免重复吃到同一撮合
+                sleep_s = (self.cooldown_ms_on_success / 1000.0) if ok else max(0.0, interval - (time.time() - t0))
+                await asyncio.sleep(sleep_s)
+                backoff = 0.05
+            except Exception as e:
+                print("[arb_perp_sniper] error:", repr(e))
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 1.0)
+
+    async def try_once(self) -> bool:
+        """
+        单次尝试：
+        1) 构造 arb_perp 指令（只带 market_index）
+        2) 先 simulate （不盈利/不交叉 -> 链上护栏拦截，仿真失败，不广播）
+        3) 通过才 send_raw_transaction
+        """
+        # 1) 构造 ix
+        ctx = Context(
+            accounts=self.accounts,
+            remaining_accounts=self.remaining_accounts
+        )
+        ix = await self.program.instruction["arb_perp"](self.market_index, ctx)
+
+        # 2) 组交易 + 可选 CU/优先费 + simulate
         tx = Transaction()
+        for cb_ix in build_compute_budget_ixs():
+            tx.add(cb_ix)
         tx.add(ix)
         tx.fee_payer = self.wallet.public_key
         latest = await self.client.get_latest_blockhash()
@@ -256,38 +162,21 @@ class JitterPairArb:
 
         sim = await self.client.simulate_transaction(tx, sig_verify=True, commitment=Processed)
         if sim.value.err is not None:
-            # 失败（包括链上护栏触发/账户不全/太慢被别人填走等）
-            return None
+            # 被链上护栏拦下（常见：无交叉、PnL<=0、账户不对、保证金不足等）——不广播
+            # 如需排查可打印 sim.value.logs
+            return False
 
-        # 5) 通过才发送
+        # 3) 通过才发
         sent = await self.client.send_raw_transaction(tx.serialize(), opts=TxOpts(skip_preflight=True))
-        sig = sent.value
-        print(f"[sent {tag} bps={bps}] {sig}")
-        return sig
+        print(f"[arb_perp] sent {sent.value}")
+        return True
 
-    async def run_forever(self):
-        # Sniper：固定频率扫描，命中就打一笔
-        interval = max(1, self.loop_interval_ms) / 1000.0
-        backoff = 0.05
-        while True:
-            t0 = time.time()
-            try:
-                _ = await self._one_try()
-                wait = max(0.0, interval - (time.time() - t0))
-                await asyncio.sleep(wait)
-                backoff = 0.05
-            except Exception as e:
-                print("[pair_arb] error:", repr(e))
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 1.0)
-
-# ===== 可执行入口（把 EnvQuoteSource 换成你的真实数据源适配）=====
 async def _main():
-    daemon = JitterPairArb(EnvQuoteSource())
+    bot = ArbPerpSniper()
     try:
-        await daemon.run_forever()
+        await bot.run_forever()
     finally:
-        await daemon.close()
+        await bot.close()
 
 if __name__ == "__main__":
     asyncio.run(_main())
