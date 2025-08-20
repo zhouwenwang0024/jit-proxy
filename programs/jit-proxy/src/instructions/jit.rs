@@ -20,6 +20,16 @@ use std::collections::BTreeSet;
 use crate::error::ErrorCode;
 use crate::state::PriceType;
 use drift::state::order_params::PostOnlyParam;
+use instructions::arb_perp_plan::arb_perp_plan;
+use instructions::arb_perp_plan::{ArbPlanArgs};
+
+#[program]
+pub mod jit_proxy {
+    use super::*;
+    pub fn arb_perp_plan(ctx: Context<instructions::arb_perp::ArbPerp>, args: ArbPlanArgs) -> Result<()> {
+        instructions::arb_perp_plan::arb_perp_plan(ctx, args)
+    }
+}
 
 pub fn jit<'c: 'info, 'info>(
     ctx: Context<'_, '_, 'c, 'info, Jit<'info>>,
